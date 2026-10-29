@@ -16,8 +16,12 @@ const int pinSalidas = 10; // Hacia la base del transistor BC547 (Zumbador/Vibra
 
 unsigned long tiempoInicioCerrado = 0;
 bool ojoCerrado = false;
-const unsigned long UMBRAL_ALERTA_MS = 2000;   // 2 segundos para iniciar la alarma física
-const unsigned long UMBRAL_CRITICO_MS = 5000;  // 5 segundos para nivel crítico
+bool alertaInicialEnviada = false;
+unsigned long ultimoEnvioTelegram = 0;
+
+const unsigned long UMBRAL_ALERTA_MS = 2000;         // 2 segundos para la alerta inicial
+const unsigned long INTERVALO_RECURRENTE_MS = 2000;  // Repetir reporte cada 2 segundos más si sigue dormido
+const unsigned long UMBRAL_CRITICO_MS = 5000;        // Nivel crítico a los 5 segundos
 
 // --- MÉTRICAS Y TELEMETRÍA ---
 int totalIncidencias = 0;
@@ -25,11 +29,11 @@ unsigned long ultimaDuracionCierre = 0;
 
 WiFiServer server(80);
 
-// --- FUNCIÓN PARA ENVIAR A TELEGRAM (Se ejecuta SOLO al abrir los ojos) ---
-void enviarAlertaTelegram(unsigned long duracionMs, int contador) {
+// --- FUNCIÓN PARA ENVIAR MENSAJES A TELEGRAM (Inicial o Recurrente) ---
+void enviarAlertaTelegram(unsigned long duracionMs, int contador, bool esRecurrente) {
   if (WiFi.status() == WL_CONNECTED) {
     WiFiClientSecure clientSecure;
-    clientSecure.setInsecure(); // Omitir verificación estricta SSL para agilizar
+    clientSecure.setInsecure(); // Omitir verificación SSL para agilizar
 
     HTTPClient http;
     String url = "https://api.telegram.org/bot" + botToken + "/sendMessage";
@@ -38,18 +42,25 @@ void enviarAlertaTelegram(unsigned long duracionMs, int contador) {
     http.addHeader("Content-Type", "application/json");
 
     float duracionSeg = duracionMs / 1000.0;
-    
     String mensaje = "";
-    if (duracionMs >= UMBRAL_CRITICO_MS) {
-      mensaje = "🚨 *¡INCIDENTE CRÍTICO EXTREMO (>5s)!* 🚨\n\n";
+
+    if (!esRecurrente) {
+      // Primer mensaje al cumplir los 2 segundos
+      mensaje = "🚨 *¡ALERTA DE FATIGA INICIAL!* 🚨\n\n";
+      mensaje += "👁️ *Umbral alcanzado:* " + String(duracionSeg, 2) + " segundos\n";
+      mensaje += "🔢 *Incidencia N°:* " + String(contador) + "\n";
+      mensaje += "⚡ *Acción:* Zumbador y vibrador activados.";
     } else {
-      mensaje = "⚠️ *¡INCIDENTE DE FATIGA REGISTRADO!* ⚠️\n\n";
+      // Mensaje recurrente si el usuario sigue con los ojos cerrados
+      if (duracionMs >= UMBRAL_CRITICO_MS) {
+        mensaje = "🚨 *¡ADVERTENCIA CRÍTICA: USUARIO AÚN DORMIDO!* 🚨\n\n";
+      } else {
+        mensaje = "⚠️ *¡AVISO RECURRENTE DE SUEÑO!* ⚠️\n\n";
+      }
+      mensaje += "💤 *El conductor sigue con los ojos cerrados.*\n";
+      mensaje += "⏱️ *Tiempo acumulado:* " + String(duracionSeg, 2) + " segundos\n";
+      mensaje += "🔢 *Incidencia N°:* " + String(contador);
     }
-    
-    mensaje += "👁️ *Duración real del cierre:* " + String(duracionSeg, 2) + " segundos\n";
-    mensaje += "🔢 *Incidencia N°:* " + String(contador) + "\n";
-    mensaje += "🔋 *Estado:* Conductor recuperó la visión\n\n";
-    mensaje += "_Acción: Alerta finalizada y reportada._";
 
     String jsonBody = "{\"chat_id\":\"" + chatId + "\", \"text\":\"" + mensaje + "\", \"parse_mode\":\"Markdown\"}";
 
@@ -60,7 +71,7 @@ void enviarAlertaTelegram(unsigned long duracionMs, int contador) {
 
 void setup() {
   Serial.begin(115200);
-  btStop(); // Apagamos Bluetooth para enfriar la placa y ahorrar energía
+  btStop(); // Apagar Bluetooth para enfriar la placa y ahorrar energía
 
   pinMode(pinSensor, INPUT_PULLUP);
   pinMode(pinSalidas, OUTPUT);
@@ -83,33 +94,45 @@ void setup() {
 }
 
 void loop() {
-  // --- 1. LÓGICA DE DETECCIÓN Y TIEMPOS ---
+  // --- 1. LÓGICA DE DETECCIÓN Y REPORTES RECURRENTES ---
   int estadoSensor = digitalRead(pinSensor);
 
   if (estadoSensor == LOW) { // Ojos cerrados
     if (!ojoCerrado) {
       tiempoInicioCerrado = millis();
       ojoCerrado = true;
+      alertaInicialEnviada = false; // Reiniciar bandera para el nuevo evento
     } else {
       unsigned long tiempoTranscurrido = millis() - tiempoInicioCerrado;
-      ultimaDuracionCierre = tiempoTranscurrido; // Cronometra en vivo para la web
+      ultimaDuracionCierre = tiempoTranscurrido; // Actualiza cronómetro para la web
       
-      // Si pasa de los 2 segundos, activa la alarma física (zumbador/vibrador)
+      // Si pasa de los 2 segundos, activamos la alarma física
       if (tiempoTranscurrido >= UMBRAL_ALERTA_MS) {
         digitalWrite(pinSalidas, HIGH); 
+        
+        // Caso A: Enviar el PRIMER mensaje exactamente al cumplir los 2s
+        if (!alertaInicialEnviada) {
+          totalIncidencias++;
+          enviarAlertaTelegram(tiempoTranscurrido, totalIncidencias, false);
+          alertaInicialEnviada = true;
+          ultimoEnvioTelegram = millis(); // Marcar tiempo del último reporte
+        } 
+        // Caso B: Si sigue dormido, enviar MENSAJES RECURRENTES cada 2 segundos más
+        else {
+          if (millis() - ultimoEnvioTelegram >= INTERVALO_RECURRENTE_MS) {
+            enviarAlertaTelegram(tiempoTranscurrido, totalIncidencias, true);
+            ultimoEnvioTelegram = millis(); // Actualizar marca de tiempo
+          }
+        }
       }
     }
-  } else { // Ojos abiertos (el evento concluyó)
+  } else { // Ojos abiertos (el usuario reaccionó)
     if (ojoCerrado) {
-      // Si el cierre duró 2 segundos o más, contabilizamos y enviamos el reporte REAL a Telegram
-      if (ultimaDuracionCierre >= UMBRAL_ALERTA_MS) {
-        totalIncidencias++;
-        Serial.println("¡Incidente terminado! Duración real: " + String(ultimaDuracionCierre / 1000.0) + " s");
-        enviarAlertaTelegram(ultimaDuracionCierre, totalIncidencias);
-      }
+      Serial.println("¡Conductor abrió los ojos! Duración total: " + String(ultimaDuracionCierre / 1000.0) + " s");
       
-      // Apagamos alarmas y reseteamos el estado para el siguiente evento
+      // Apagamos alarmas físicas y reseteamos variables para el siguiente evento
       ojoCerrado = false;
+      alertaInicialEnviada = false;
       digitalWrite(pinSalidas, LOW); 
     }
   }
@@ -130,7 +153,7 @@ void loop() {
     }
 
     if (peticionHttp.indexOf("GET /RESET") >= 0) {
-      totalIncidencias = 0; // Reiniciar contador
+      totalIncidencias = 0; // Reiniciar contador de incidencias
     }
 
     client.println("HTTP/1.1 200 OK");
