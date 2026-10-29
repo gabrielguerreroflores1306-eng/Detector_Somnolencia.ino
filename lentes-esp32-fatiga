@@ -16,55 +16,71 @@ const int pinSalidas = 10; // Hacia la base del transistor BC547 (Zumbador/Vibra
 
 unsigned long tiempoInicioCerrado = 0;
 bool ojoCerrado = false;
-int avisosEnviados = 0; // Controla cuántos mensajes se han mandado en este mismo cierre de ojos
-unsigned long ultimoEnvioTelegram = 0;
+int avisosEnviados = 0;      
+int incidenciaActual = 0;    
 
-const unsigned long UMBRAL_ALERTA_MS = 2000;         // 2 segundos (Primer aviso)
-const unsigned long INTERVALO_RECURRENTE_MS = 2000;  // Cada 2 segundos adicionales (4s, 6s, 8s...)
-const unsigned long UMBRAL_CRITICO_MS = 5000;        // Nivel crítico a los 5 segundos
+const unsigned long UMBRAL_ALERTA_MS = 2000;         
+const unsigned long INTERVALO_RECURRENTE_MS = 2000;  
+const unsigned long UMBRAL_CRITICO_MS = 5000;        
 
-// --- MÉTRICAS Y TELEMETRÍA ---
 int totalIncidencias = 0;
 unsigned long ultimaDuracionCierre = 0;
 
 WiFiServer server(80);
 
-// --- FUNCIÓN PARA ENVIAR MENSAJES A TELEGRAM ---
-void enviarAlertaTelegram(unsigned long duracionMs, int contador, int numAviso) {
-  if (WiFi.status() == WL_CONNECTED) {
-    WiFiClientSecure clientSecure;
-    clientSecure.setInsecure(); // Omitir verificación SSL para agilizar
+// Estructura para pasar datos a la tarea de Telegram de forma segura
+struct MensajeTelegram {
+  unsigned long duracionMs;
+  int contador;
+  int tipoMensaje; // 1: Inicial, 2: Recurrente, 3: Cierre
+};
 
-    HTTPClient http;
-    String url = "https://api.telegram.org/bot" + botToken + "/sendMessage";
-    
-    http.begin(clientSecure, url);
-    http.addHeader("Content-Type", "application/json");
+// Cola de mensajes para FreeRTOS (evita que el loop se congele)
+QueueHandle_t colaTelegram;
 
-    float duracionSeg = duracionMs / 1000.0;
-    String mensaje = "";
+// --- TAREA EN SEGUNDO PLANO PARA TELEGRAM (Corre en paralelo lógico)൪
+void tareaTelegram(void *pvParameters) {
+  MensajeTelegram msg;
+  while (true) {
+    // Espera a que haya un mensaje en la cola sin bloquear el ESP32
+    if (xQueueReceive(colaTelegram, &msg, portMAX_DELAY) == pdPASS) {
+      if (WiFi.status() == WL_CONNECTED) {
+        WiFiClientSecure clientSecure;
+        clientSecure.setInsecure(); 
 
-    if (numAviso == 1) {
-      mensaje = "🚨 *¡ALERTA DE FATIGA INICIAL!* 🚨\n\n";
-      mensaje += "👁️ *Umbral alcanzado:* " + String(duracionSeg, 2) + " segundos\n";
-      mensaje += "🔢 *Incidencia N°:* " + String(contador) + "\n";
-      mensaje += "⚡ *Acción:* Zumbador y vibrador activados.";
-    } else {
-      if (duracionMs >= UMBRAL_CRITICO_MS) {
-        mensaje = "🚨 *¡ADVERTENCIA CRÍTICA: USUARIO AÚN DORMIDO!* 🚨\n\n";
-      } else {
-        mensaje = "⚠️ *¡AVISO RECURRENTE DE SUEÑO!* ⚠️\n\n";
+        HTTPClient http;
+        String url = "https://api.telegram.org/bot" + botToken + "/sendMessage";
+        
+        http.begin(clientSecure, url);
+        http.addHeader("Content-Type", "application/json");
+
+        float duracionSeg = msg.duracionMs / 1000.0;
+        String texto = "";
+
+        if (msg.tipoMensaje == 1) {
+          texto = "🚨 *¡ALERTA DE FATIGA INICIAL!* 🚨\n\n👁️ *Umbral:* " + String(duracionSeg, 2) + "s\n🔢 *Incidencia N°:* " + String(msg.contador) + "\n⚡ *Acción:* Actuadores encendidos.";
+        } else if (msg.tipoMensaje == 2) {
+          if (msg.duracionMs >= UMBRAL_CRITICO_MS) {
+            texto = "🚨 *¡ADVERTENCIA CRÍTICA (>5s)!* 🚨\n\n💤 *Conductor dormido.*\n⏱️ *Acumulado:* " + String(duracionSeg, 2) + "s\n🔢 *Incidencia N°:* " + String(msg.contador);
+          } else {
+            texto = "⚠️ *¡AVISO RECURRENTE DE SUEÑO!* ⚠️\n\n⏱️ *Acumulado:* " + String(duracionSeg, 2) + "s\n🔢 *Incidencia N°:* " + String(msg.contador);
+          }
+        } else if (msg.tipoMensaje == 3) {
+          texto = "✅ *¡INCIDENTE FINALIZADO!* ✅\n\n👁️ *Ojos abiertos.*\n⏱️ *Duración total:* " + String(duracionSeg, 2) + "s\n🔢 *Incidencia N°:* " + String(msg.contador);
+        }
+
+        String jsonBody = "{\"chat_id\":\"" + chatId + "\", \"text\":\"" + texto + "\", \"parse_mode\":\"Markdown\"}";
+        http.POST(jsonBody);
+        http.end();
       }
-      mensaje += "💤 *El conductor sigue con los ojos cerrados.*\n";
-      mensaje += "⏱️ *Tiempo acumulado:* " + String(duracionSeg, 2) + " segundos\n";
-      mensaje += "🔢 *Incidencia N°:* " + String(contador);
     }
-
-    String jsonBody = "{\"chat_id\":\"" + chatId + "\", \"text\":\"" + mensaje + "\", \"parse_mode\":\"Markdown\"}";
-
-    http.POST(jsonBody);
-    http.end();
   }
+}
+
+// Función auxiliar para enviar a la cola sin bloquear
+void encolarTelegram(unsigned long duracion, int contador, int tipo) {
+  MensajeTelegram msg = {duracion, contador, tipo};
+  xQueueSend(colaTelegram, &msg, 0);
 }
 
 void setup() {
@@ -79,67 +95,72 @@ void setup() {
   WiFi.begin(ssid, password);
   WiFi.setTxPower(WIFI_POWER_8_5dBm); 
 
-  Serial.print("Conectando a tu red Wi-Fi");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
-    Serial.print(".");
   }
 
+  // Crear la cola y la tarea independiente en FreeRTOS
+  colaTelegram = xQueueCreate(10, sizeof(MensajeTelegram));
+  xTaskCreatePinnedToCore(
+    tareaTelegram,   // Función de la tarea
+    "TelegramTask",  // Nombre
+    4096,            // Memoria Stack
+    NULL,            // Parámetros
+    1,               // Prioridad
+    NULL, 
+    0                // Núcleo 0
+  );
+
   server.begin();
-  Serial.println("\n--- ¡SERVIDOR DE MONITOREO LISTO! ---");
-  Serial.print("Entra a esta dirección desde tu celular: http://");
-  Serial.println(WiFi.localIP());
 }
 
 void loop() {
-  // --- 1. LÓGICA DE DETECCIÓN Y REPORTES SECUENCIALES EXACTOS ---
+  // --- 1. LÓGICA DE DETECCIÓN FÍSICA CRÍTICA (Sin bloqueos) ---
   int estadoSensor = digitalRead(pinSensor);
 
   if (estadoSensor == LOW) { // Ojos cerrados
     if (!ojoCerrado) {
       tiempoInicioCerrado = millis();
       ojoCerrado = true;
-      avisosEnviados = 0; // Reiniciar contador de avisos para este nuevo evento
+      avisosEnviados = 0; 
     } else {
       unsigned long tiempoTranscurrido = millis() - tiempoInicioCerrado;
       ultimaDuracionCierre = tiempoTranscurrido; 
       
       if (tiempoTranscurrido >= UMBRAL_ALERTA_MS) {
-        digitalWrite(pinSalidas, HIGH); // Activar zumbador y vibrador
+        digitalWrite(pinSalidas, HIGH); // Activa zumbador y motor al instante
 
-        // Aviso 1: Exactamente al cumplir los 2 segundos (si no se ha enviado ninguno)
         if (avisosEnviados == 0) {
-          totalIncidencias++; // Incrementamos la incidencia real aquí
-          enviarAlertaTelegram(tiempoTranscurrido, totalIncidencias, 1);
+          totalIncidencias++;
+          incidenciaActual = totalIncidencias; 
+          encolarTelegram(tiempoTranscurrido, incidenciaActual, 1); // Envía a segundo plano
           avisosEnviados = 1;
-          ultimoEnvioTelegram = millis();
-        } 
-        // Avisos recurrentes: Exactamente cada 2 segundos adicionales (4s, 6s, 8s...) basándose en marcas fijas
-        else {
+        } else {
           unsigned long tiempoEsperado = UMBRAL_ALERTA_MS + (avisosEnviados * INTERVALO_RECURRENTE_MS);
           if (tiempoTranscurrido >= tiempoEsperado) {
-            enviarAlertaTelegram(tiempoTranscurrido, totalIncidencias, avisosEnviados + 1);
+            encolarTelegram(tiempoTranscurrido, incidenciaActual, 2); // Envía a segundo plano
             avisosEnviados++;
           }
         }
       }
     }
-  } else { // Ojos abiertos
+  } else { // Ojos abiertos -> RESPUESTA FÍSICA INMEDIATA
+    digitalWrite(pinSalidas, LOW); // Corta la electricidad al motor y zumbador al microsegundo
+
     if (ojoCerrado) {
-      Serial.println("¡Conductor abrió los ojos! Duración total: " + String(ultimaDuracionCierre / 1000.0) + " s");
+      if (avisosEnviados > 0) {
+        encolarTelegram(ultimaDuracionCierre, incidenciaActual, 3); // Cierre a segundo plano
+      }
       ojoCerrado = false;
       avisosEnviados = 0;
-      digitalWrite(pinSalidas, LOW); 
     }
   }
 
-  // --- 2. GESTIÓN DE PETICIONES WEB (Anti-Caché) ---
+  // --- 2. GESTIÓN WEB LOCAL (No bloqueante) ---
   WiFiClient client = server.available();
-  
   if (client) {
     String peticionHttp = "";
     unsigned long timeoutHttp = millis();
-    
     while (client.connected() && millis() - timeoutHttp < 150) {
       if (client.available()) {
         char c = client.read();
@@ -155,7 +176,6 @@ void loop() {
     client.println("HTTP/1.1 200 OK");
     client.println("Content-Type: text/html; charset=utf-8");
     client.println("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
-    client.println("Pragma: no-cache");
     client.println("Connection: close");
     client.println();
     
@@ -165,40 +185,24 @@ void loop() {
     client.println("<title>Monitor de Somnolencia IoT</title>");
     client.println("<style>");
     client.println("body { font-family: Arial, sans-serif; background: #121212; color: #fff; text-align: center; padding: 20px; }");
-    client.println(".card { background: #1e1e1e; padding: 20px; margin: 15px auto; max-width: 400px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }");
+    client.println(".card { background: #1e1e1e; padding: 20px; margin: 15px auto; max-width: 400px; border-radius: 12px; }");
     client.println("h1 { color: #00e676; font-size: 1.5em; }");
     client.println(".metric { font-size: 2em; font-weight: bold; color: #ff5252; }");
     client.println(".status { font-size: 1.2em; padding: 10px; border-radius: 8px; margin-top: 10px; }");
     client.println(".ok { background: #1b5e20; color: #81c784; }");
     client.println(".alert { background: #b71c1c; color: #ff8a80; }");
-    client.println(".critical { background: #d50000; color: #fff; animation: blink 0.5s infinite; }");
-    client.println("@keyframes blink { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }");
     client.println("</style></head><body>");
     
     client.println("<h1>MONITOR DE FATIGA ESP32-C3</h1>");
-    
     client.println("<div class='card'><h3>Estado Actual</h3>");
     if (ojoCerrado) {
-      unsigned long tiempoActual = millis() - tiempoInicioCerrado;
-      if (tiempoActual >= UMBRAL_CRITICO_MS) {
-        client.println("<div class='status critical'>🚨 ¡PELIGRO CRÍTICO (>5s)!</div>");
-      } else if (tiempoActual >= UMBRAL_ALERTA_MS) {
-        client.println("<div class='status alert'>⚠️ ALERTA: OJO CERRADO</div>");
-      } else {
-        client.println("<div class='status ok'>👁️ EVALUANDO...</div>");
-      }
+      client.println("<div class='status alert'>⚠️ ALERTA: OJO CERRADO</div>");
     } else {
       client.println("<div class='status ok'>🟢 CONDUCTOR ALERTA</div>");
     }
     client.println("</div>");
-
-    client.println("<div class='card'><h3>Incidencias Registradas</h3>");
-    client.println("<div class='metric'>" + String(totalIncidencias) + "</div></div>");
-
-    client.println("<div class='card'><h3>Duración del Cierre Actual</h3>");
-    client.println("<div class='metric'>" + String(ultimaDuracionCierre / 1000.0, 2) + " s</div></div>");
-
-    client.println("<br><a href='/RESET' style='color: #00e676; font-size: 18px;'>[ Reiniciar Contador ]</a>");
+    client.println("<div class='card'><h3>Incidencias</h3><div class='metric'>" + String(totalIncidencias) + "</div></div>");
+    client.println("<br><a href='/RESET' style='color: #00e676;'>[ Reiniciar Contador ]</a>");
     client.println("</body></html>");
     client.stop();
   }
