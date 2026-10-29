@@ -20,7 +20,7 @@ bool alertaInicialEnviada = false;
 unsigned long ultimoEnvioTelegram = 0;
 
 const unsigned long UMBRAL_ALERTA_MS = 2000;         // 2 segundos para la alerta inicial
-const unsigned long INTERVALO_RECURRENTE_MS = 2000;  // Repetir reporte cada 2 segundos más si sigue dormido
+const unsigned long INTERVALO_RECURRENTE_MS = 2000;  // Intervalo estricto de 2 segundos entre mensajes
 const unsigned long UMBRAL_CRITICO_MS = 5000;        // Nivel crítico a los 5 segundos
 
 // --- MÉTRICAS Y TELEMETRÍA ---
@@ -29,7 +29,7 @@ unsigned long ultimaDuracionCierre = 0;
 
 WiFiServer server(80);
 
-// --- FUNCIÓN PARA ENVIAR MENSAJES A TELEGRAM (Inicial o Recurrente) ---
+// --- FUNCIÓN PARA ENVIAR MENSAJES A TELEGRAM ---
 void enviarAlertaTelegram(unsigned long duracionMs, int contador, bool esRecurrente) {
   if (WiFi.status() == WL_CONNECTED) {
     WiFiClientSecure clientSecure;
@@ -45,13 +45,11 @@ void enviarAlertaTelegram(unsigned long duracionMs, int contador, bool esRecurre
     String mensaje = "";
 
     if (!esRecurrente) {
-      // Primer mensaje al cumplir los 2 segundos
       mensaje = "🚨 *¡ALERTA DE FATIGA INICIAL!* 🚨\n\n";
       mensaje += "👁️ *Umbral alcanzado:* " + String(duracionSeg, 2) + " segundos\n";
       mensaje += "🔢 *Incidencia N°:* " + String(contador) + "\n";
       mensaje += "⚡ *Acción:* Zumbador y vibrador activados.";
     } else {
-      // Mensaje recurrente si el usuario sigue con los ojos cerrados
       if (duracionMs >= UMBRAL_CRITICO_MS) {
         mensaje = "🚨 *¡ADVERTENCIA CRÍTICA: USUARIO AÚN DORMIDO!* 🚨\n\n";
       } else {
@@ -71,15 +69,15 @@ void enviarAlertaTelegram(unsigned long duracionMs, int contador, bool esRecurre
 
 void setup() {
   Serial.begin(115200);
-  btStop(); // Apagar Bluetooth para enfriar la placa y ahorrar energía
+  btStop(); 
 
   pinMode(pinSensor, INPUT_PULLUP);
   pinMode(pinSalidas, OUTPUT);
-  digitalWrite(pinSalidas, LOW); // Salida apagada por defecto
+  digitalWrite(pinSalidas, LOW); 
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
-  WiFi.setTxPower(WIFI_POWER_8_5dBm); // Potencia de red estable
+  WiFi.setTxPower(WIFI_POWER_8_5dBm); 
 
   Serial.print("Conectando a tu red Wi-Fi");
   while (WiFi.status() != WL_CONNECTED) {
@@ -94,43 +92,41 @@ void setup() {
 }
 
 void loop() {
-  // --- 1. LÓGICA DE DETECCIÓN Y REPORTES RECURRENTES ---
+  // --- 1. LÓGICA DE DETECCIÓN Y REPORTES RECURRENTES PRECISOS ---
   int estadoSensor = digitalRead(pinSensor);
 
   if (estadoSensor == LOW) { // Ojos cerrados
     if (!ojoCerrado) {
       tiempoInicioCerrado = millis();
       ojoCerrado = true;
-      alertaInicialEnviada = false; // Reiniciar bandera para el nuevo evento
+      alertaInicialEnviada = false; 
     } else {
       unsigned long tiempoTranscurrido = millis() - tiempoInicioCerrado;
-      ultimaDuracionCierre = tiempoTranscurrido; // Actualiza cronómetro para la web
+      ultimaDuracionCierre = tiempoTranscurrido; 
       
-      // Si pasa de los 2 segundos, activamos la alarma física
       if (tiempoTranscurrido >= UMBRAL_ALERTA_MS) {
         digitalWrite(pinSalidas, HIGH); 
         
-        // Caso A: Enviar el PRIMER mensaje exactamente al cumplir los 2s
+        // Primer mensaje exactamente al cumplir los 2s
         if (!alertaInicialEnviada) {
           totalIncidencias++;
           enviarAlertaTelegram(tiempoTranscurrido, totalIncidencias, false);
           alertaInicialEnviada = true;
-          ultimoEnvioTelegram = millis(); // Marcar tiempo del último reporte
+          ultimoEnvioTelegram = millis(); // Referencia inicial
         } 
-        // Caso B: Si sigue dormido, enviar MENSAJES RECURRENTES cada 2 segundos más
+        // Mensajes recurrentes alineados rítmicamente (cada 2 segundos exactos)
         else {
           if (millis() - ultimoEnvioTelegram >= INTERVALO_RECURRENTE_MS) {
             enviarAlertaTelegram(tiempoTranscurrido, totalIncidencias, true);
-            ultimoEnvioTelegram = millis(); // Actualizar marca de tiempo
+            // Sumar el intervalo de forma fija previene la acumulación de retraso por el bloqueo de red
+            ultimoEnvioTelegram += INTERVALO_RECURRENTE_MS; 
           }
         }
       }
     }
-  } else { // Ojos abiertos (el usuario reaccionó)
+  } else { // Ojos abiertos
     if (ojoCerrado) {
       Serial.println("¡Conductor abrió los ojos! Duración total: " + String(ultimaDuracionCierre / 1000.0) + " s");
-      
-      // Apagamos alarmas físicas y reseteamos variables para el siguiente evento
       ojoCerrado = false;
       alertaInicialEnviada = false;
       digitalWrite(pinSalidas, LOW); 
@@ -153,7 +149,7 @@ void loop() {
     }
 
     if (peticionHttp.indexOf("GET /RESET") >= 0) {
-      totalIncidencias = 0; // Reiniciar contador de incidencias
+      totalIncidencias = 0; 
     }
 
     client.println("HTTP/1.1 200 OK");
