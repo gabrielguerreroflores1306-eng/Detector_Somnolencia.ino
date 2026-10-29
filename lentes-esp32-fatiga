@@ -16,8 +16,8 @@ const int pinSalidas = 10; // Hacia la base del transistor BC547 (Zumbador/Vibra
 
 unsigned long tiempoInicioCerrado = 0;
 bool ojoCerrado = false;
-const unsigned long UMBRAL_ALERTA_MS = 2000;   // 2 segundos para iniciar alerta
-const unsigned long UMBRAL_CRITICO_MS = 5000;  // 5 segundos para nivel crítico extremo
+const unsigned long UMBRAL_ALERTA_MS = 2000;   // 2 segundos para iniciar la alarma física
+const unsigned long UMBRAL_CRITICO_MS = 5000;  // 5 segundos para nivel crítico
 
 // --- MÉTRICAS Y TELEMETRÍA ---
 int totalIncidencias = 0;
@@ -25,7 +25,7 @@ unsigned long ultimaDuracionCierre = 0;
 
 WiFiServer server(80);
 
-// --- FUNCIÓN PARA ENVIAR MENSAJES A TELEGRAM (Al abrir los ojos) ---
+// --- FUNCIÓN PARA ENVIAR A TELEGRAM (Se ejecuta SOLO al abrir los ojos) ---
 void enviarAlertaTelegram(unsigned long duracionMs, int contador) {
   if (WiFi.status() == WL_CONNECTED) {
     WiFiClientSecure clientSecure;
@@ -39,18 +39,17 @@ void enviarAlertaTelegram(unsigned long duracionMs, int contador) {
 
     float duracionSeg = duracionMs / 1000.0;
     
-    // Clasificación de gravedad según la duración
     String mensaje = "";
     if (duracionMs >= UMBRAL_CRITICO_MS) {
-      mensaje = "🚨 *¡ALERTA CRÍTICA EXTREMA (>5s)!* 🚨\n\n";
+      mensaje = "🚨 *¡INCIDENTE CRÍTICO EXTREMO (>5s)!* 🚨\n\n";
     } else {
       mensaje = "⚠️ *¡INCIDENTE DE FATIGA REGISTRADO!* ⚠️\n\n";
     }
     
-    mensaje += "👁️ *Duración total del cierre:* " + String(duracionSeg, 2) + " segundos\n";
+    mensaje += "👁️ *Duración real del cierre:* " + String(duracionSeg, 2) + " segundos\n";
     mensaje += "🔢 *Incidencia N°:* " + String(contador) + "\n";
     mensaje += "🔋 *Estado:* Conductor recuperó la visión\n\n";
-    mensaje += "_Acción: Alerta finalizada y notificada._";
+    mensaje += "_Acción: Alerta finalizada y reportada._";
 
     String jsonBody = "{\"chat_id\":\"" + chatId + "\", \"text\":\"" + mensaje + "\", \"parse_mode\":\"Markdown\"}";
 
@@ -84,7 +83,7 @@ void setup() {
 }
 
 void loop() {
-  // --- 1. LÓGICA DE DETECCIÓN Y GESTIÓN DE TIEMPOS ---
+  // --- 1. LÓGICA DE DETECCIÓN Y TIEMPOS ---
   int estadoSensor = digitalRead(pinSensor);
 
   if (estadoSensor == LOW) { // Ojos cerrados
@@ -93,34 +92,29 @@ void loop() {
       ojoCerrado = true;
     } else {
       unsigned long tiempoTranscurrido = millis() - tiempoInicioCerrado;
-      ultimaDuracionCierre = tiempoTranscurrido; // Actualización en tiempo real para la web
+      ultimaDuracionCierre = tiempoTranscurrido; // Cronometra en vivo para la web
       
-      // Si pasa de los 2 segundos, activamos la alarma física (zumbador y vibrador)
+      // Si pasa de los 2 segundos, activa la alarma física (zumbador/vibrador)
       if (tiempoTranscurrido >= UMBRAL_ALERTA_MS) {
         digitalWrite(pinSalidas, HIGH); 
-        
-        if (tiempoTranscurrido >= UMBRAL_CRITICO_MS) {
-          // Aquí puedes añadir lógica adicional si deseas cambiar el patrón del zumbador (ej. parpadeo rápido)
-          // El pin se mantiene en HIGH de manera continua por seguridad crítica.
-        }
       }
     }
-  } else { // Ojos abiertos (el conductor reaccionó o terminó el cierre)
+  } else { // Ojos abiertos (el evento concluyó)
     if (ojoCerrado) {
-      // El evento concluyó. Verificamos si duró lo suficiente como para considerarse incidencia (>= 2s)
+      // Si el cierre duró 2 segundos o más, contabilizamos y enviamos el reporte REAL a Telegram
       if (ultimaDuracionCierre >= UMBRAL_ALERTA_MS) {
         totalIncidencias++;
-        Serial.println("¡Incidente terminado! Duración: " + String(ultimaDuracionCierre / 1000.0) + " s");
+        Serial.println("¡Incidente terminado! Duración real: " + String(ultimaDuracionCierre / 1000.0) + " s");
         enviarAlertaTelegram(ultimaDuracionCierre, totalIncidencias);
       }
       
-      // Reseteamos el estado del evento y apagamos las alarmas físicas
+      // Apagamos alarmas y reseteamos el estado para el siguiente evento
       ojoCerrado = false;
       digitalWrite(pinSalidas, LOW); 
     }
   }
 
-  // --- 2. GESTIÓN DE PETICIONES WEB HTTP (No bloqueante con Anti-Caché) ---
+  // --- 2. GESTIÓN DE PETICIONES WEB (Anti-Caché) ---
   WiFiClient client = server.available();
   
   if (client) {
@@ -136,10 +130,9 @@ void loop() {
     }
 
     if (peticionHttp.indexOf("GET /RESET") >= 0) {
-      totalIncidencias = 0; // Reiniciar contador de incidencias
+      totalIncidencias = 0; // Reiniciar contador
     }
 
-    // Respuesta HTTP con cabeceras estrictas Anti-Caché
     client.println("HTTP/1.1 200 OK");
     client.println("Content-Type: text/html; charset=utf-8");
     client.println("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
@@ -149,7 +142,7 @@ void loop() {
     
     client.println("<!DOCTYPE html><html lang='es'><head><meta charset='UTF-8'>");
     client.println("<meta name='viewport' content='width=device-width, initial-scale=1.0'>");
-    client.println("<meta http-equiv='refresh' content='2'>"); // Recarga automática cada 2 segundos
+    client.println("<meta http-equiv='refresh' content='2'>");
     client.println("<title>Monitor de Somnolencia IoT</title>");
     client.println("<style>");
     client.println("body { font-family: Arial, sans-serif; background: #121212; color: #fff; text-align: center; padding: 20px; }");
@@ -183,7 +176,7 @@ void loop() {
     client.println("<div class='card'><h3>Incidencias Registradas</h3>");
     client.println("<div class='metric'>" + String(totalIncidencias) + "</div></div>");
 
-    client.println("<div class='card'><h3>Duración del Evento / Último Cierre</h3>");
+    client.println("<div class='card'><h3>Duración del Cierre Actual</h3>");
     client.println("<div class='metric'>" + String(ultimaDuracionCierre / 1000.0, 2) + " s</div></div>");
 
     client.println("<br><a href='/RESET' style='color: #00e676; font-size: 18px;'>[ Reiniciar Contador ]</a>");
