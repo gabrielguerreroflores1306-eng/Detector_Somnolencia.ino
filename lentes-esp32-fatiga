@@ -16,11 +16,11 @@ const int pinSalidas = 10; // Hacia la base del transistor BC547 (Zumbador/Vibra
 
 unsigned long tiempoInicioCerrado = 0;
 bool ojoCerrado = false;
-bool alertaInicialEnviada = false;
+int avisosEnviados = 0; // Controla cuántos mensajes se han mandado en este mismo cierre de ojos
 unsigned long ultimoEnvioTelegram = 0;
 
-const unsigned long UMBRAL_ALERTA_MS = 2000;         // 2 segundos para la alerta inicial
-const unsigned long INTERVALO_RECURRENTE_MS = 2000;  // Intervalo estricto de 2 segundos entre mensajes
+const unsigned long UMBRAL_ALERTA_MS = 2000;         // 2 segundos (Primer aviso)
+const unsigned long INTERVALO_RECURRENTE_MS = 2000;  // Cada 2 segundos adicionales (4s, 6s, 8s...)
 const unsigned long UMBRAL_CRITICO_MS = 5000;        // Nivel crítico a los 5 segundos
 
 // --- MÉTRICAS Y TELEMETRÍA ---
@@ -30,7 +30,7 @@ unsigned long ultimaDuracionCierre = 0;
 WiFiServer server(80);
 
 // --- FUNCIÓN PARA ENVIAR MENSAJES A TELEGRAM ---
-void enviarAlertaTelegram(unsigned long duracionMs, int contador, bool esRecurrente) {
+void enviarAlertaTelegram(unsigned long duracionMs, int contador, int numAviso) {
   if (WiFi.status() == WL_CONNECTED) {
     WiFiClientSecure clientSecure;
     clientSecure.setInsecure(); // Omitir verificación SSL para agilizar
@@ -44,7 +44,7 @@ void enviarAlertaTelegram(unsigned long duracionMs, int contador, bool esRecurre
     float duracionSeg = duracionMs / 1000.0;
     String mensaje = "";
 
-    if (!esRecurrente) {
+    if (numAviso == 1) {
       mensaje = "🚨 *¡ALERTA DE FATIGA INICIAL!* 🚨\n\n";
       mensaje += "👁️ *Umbral alcanzado:* " + String(duracionSeg, 2) + " segundos\n";
       mensaje += "🔢 *Incidencia N°:* " + String(contador) + "\n";
@@ -92,34 +92,34 @@ void setup() {
 }
 
 void loop() {
-  // --- 1. LÓGICA DE DETECCIÓN Y REPORTES RECURRENTES PRECISOS ---
+  // --- 1. LÓGICA DE DETECCIÓN Y REPORTES SECUENCIALES EXACTOS ---
   int estadoSensor = digitalRead(pinSensor);
 
   if (estadoSensor == LOW) { // Ojos cerrados
     if (!ojoCerrado) {
       tiempoInicioCerrado = millis();
       ojoCerrado = true;
-      alertaInicialEnviada = false; 
+      avisosEnviados = 0; // Reiniciar contador de avisos para este nuevo evento
     } else {
       unsigned long tiempoTranscurrido = millis() - tiempoInicioCerrado;
       ultimaDuracionCierre = tiempoTranscurrido; 
       
       if (tiempoTranscurrido >= UMBRAL_ALERTA_MS) {
-        digitalWrite(pinSalidas, HIGH); 
-        
-        // Primer mensaje exactamente al cumplir los 2s
-        if (!alertaInicialEnviada) {
-          totalIncidencias++;
-          enviarAlertaTelegram(tiempoTranscurrido, totalIncidencias, false);
-          alertaInicialEnviada = true;
-          ultimoEnvioTelegram = millis(); // Referencia inicial
+        digitalWrite(pinSalidas, HIGH); // Activar zumbador y vibrador
+
+        // Aviso 1: Exactamente al cumplir los 2 segundos (si no se ha enviado ninguno)
+        if (avisosEnviados == 0) {
+          totalIncidencias++; // Incrementamos la incidencia real aquí
+          enviarAlertaTelegram(tiempoTranscurrido, totalIncidencias, 1);
+          avisosEnviados = 1;
+          ultimoEnvioTelegram = millis();
         } 
-        // Mensajes recurrentes alineados rítmicamente (cada 2 segundos exactos)
+        // Avisos recurrentes: Exactamente cada 2 segundos adicionales (4s, 6s, 8s...) basándose en marcas fijas
         else {
-          if (millis() - ultimoEnvioTelegram >= INTERVALO_RECURRENTE_MS) {
-            enviarAlertaTelegram(tiempoTranscurrido, totalIncidencias, true);
-            // Sumar el intervalo de forma fija previene la acumulación de retraso por el bloqueo de red
-            ultimoEnvioTelegram += INTERVALO_RECURRENTE_MS; 
+          unsigned long tiempoEsperado = UMBRAL_ALERTA_MS + (avisosEnviados * INTERVALO_RECURRENTE_MS);
+          if (tiempoTranscurrido >= tiempoEsperado) {
+            enviarAlertaTelegram(tiempoTranscurrido, totalIncidencias, avisosEnviados + 1);
+            avisosEnviados++;
           }
         }
       }
@@ -128,7 +128,7 @@ void loop() {
     if (ojoCerrado) {
       Serial.println("¡Conductor abrió los ojos! Duración total: " + String(ultimaDuracionCierre / 1000.0) + " s");
       ojoCerrado = false;
-      alertaInicialEnviada = false;
+      avisosEnviados = 0;
       digitalWrite(pinSalidas, LOW); 
     }
   }
