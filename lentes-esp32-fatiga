@@ -1,0 +1,155 @@
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+
+// --- CONFIGURACIÓN DE RED Y TELEGRAM ---
+const char* ssid = "IoTNet";
+const char* password = "11112222";
+
+String botToken = "9197373664:AAHtmkGadsu09L0vnvblN86FtrCf9G-HJPg";     
+String chatId = "1679495937";         
+
+// --- DEFINICIÓN DE PINES Y PARÁMETROS ---
+const int pinSensor = 2;   // OUT del sensor FC-51
+const int pinSalidas = 10; // Hacia la base del transistor BC547 (Zumbador/Vibrador)
+
+unsigned long tiempoInicioCerrado = 0;
+bool ojoCerrado = false;
+const unsigned long UMBRAL_TIEMPO_MS = 2000; // 2 segundos para activar alerta
+
+// --- MÉTRICAS Y TELEMETRÍA ---
+int totalIncidencias = 0;
+unsigned long ultimaDuracionCierre = 0;
+
+WiFiServer server(80);
+
+// --- FUNCIÓN PARA ENVIAR MENSAJES A TELEGRAM ---
+void enviarAlertaTelegram(unsigned long duracionMs, int contador) {
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFiClientSecure clientSecure;
+    clientSecure.setInsecure();
+
+    HTTPClient http;
+    String url = "https://api.telegram.org/bot" + botToken + "/sendMessage";
+    
+    http.begin(clientSecure, url);
+    http.addHeader("Content-Type", "application/json");
+
+    float duracionSeg = duracionMs / 1000.0;
+    String mensaje = "🚨 *¡ALERTA DE FATIGA CRÍTICA!* 🚨\n\n";
+    mensaje += "👁️ *Duración del cierre:* " + String(duracionSeg, 2) + " segundos\n";
+    mensaje += "🔢 *Incidencia N°:* " + String(contador) + "\n";
+    mensaje += "🔋 *Estado:* Sistema Activo (IoTNet)\n\n";
+    mensaje += "_Acción: Zumbador y vibrador activados._";
+
+    String jsonBody = "{\"chat_id\":\"" + chatId + "\", \"text\":\"" + mensaje + "\", \"parse_mode\":\"Markdown\"}";
+
+    http.POST(jsonBody);
+    http.end();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  btStop(); // Apagar Bluetooth para enfriar el chip y ahorrar recursos
+
+  pinMode(pinSensor, INPUT_PULLUP);
+  pinMode(pinSalidas, OUTPUT);
+  digitalWrite(pinSalidas, LOW);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm); // Potencia de red estable
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+  }
+
+  server.begin();
+}
+
+void loop() {
+  // --- 1. LÓGICA DE DETECCIÓN (Prioridad inmediata sin retrasos) ---
+  int estadoSensor = digitalRead(pinSensor);
+
+  if (estadoSensor == LOW) {
+    if (!ojoCerrado) {
+      tiempoInicioCerrado = millis();
+      ojoCerrado = true;
+    } else {
+      unsigned long tiempoTranscurrido = millis() - tiempoInicioCerrado;
+      
+      if (tiempoTranscurrido >= UMBRAL_TIEMPO_MS) {
+        if (digitalRead(pinSalidas) == LOW) { 
+          digitalWrite(pinSalidas, HIGH); // Activa zumbador/vibrador de inmediato
+          totalIncidencias++;
+          ultimaDuracionCierre = tiempoTranscurrido;
+          enviarAlertaTelegram(tiempoTranscurrido, totalIncidencias);
+        } else {
+          ultimaDuracionCierre = tiempoTranscurrido;
+        }
+      }
+    }
+  } else {
+    ojoCerrado = false;
+    digitalWrite(pinSalidas, LOW);
+  }
+
+  // --- 2. SERVIDOR WEB NO BLOQUEANTE ---
+  WiFiClient client = server.available();
+  if (client) {
+    String peticionHttp = "";
+    unsigned long timeoutHttp = millis();
+    
+    while (client.connected() && millis() - timeoutHttp < 150) {
+      if (client.available()) {
+        char c = client.read();
+        peticionHttp += c;
+        if (c == '\n') break;
+      }
+    }
+
+    if (peticionHttp.indexOf("GET /RESET") >= 0) {
+      totalIncidencias = 0;
+    }
+
+    client.println("HTTP/1.1 200 OK");
+    client.println("Content-Type: text/html; charset=utf-8");
+    client.println("Connection: close");
+    client.println();
+    
+    client.println("<!DOCTYPE html><html lang='es'><head><meta charset='UTF-8'>");
+    client.println("<meta name='viewport' content='width=device-width, initial-scale=1.0'>");
+    client.println("<meta http-equiv='refresh' content='2'>");
+    client.println("<title>Monitor de Somnolencia IoT</title>");
+    client.println("<style>");
+    client.println("body { font-family: Arial, sans-serif; background: #121212; color: #fff; text-align: center; padding: 20px; }");
+    client.println(".card { background: #1e1e1e; padding: 20px; margin: 15px auto; max-width: 400px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }");
+    client.println("h1 { color: #00e676; font-size: 1.5em; }");
+    client.println(".metric { font-size: 2em; font-weight: bold; color: #ff5252; }");
+    client.println(".status { font-size: 1.2em; padding: 10px; border-radius: 8px; margin-top: 10px; }");
+    client.println(".ok { background: #1b5e20; color: #81c784; }");
+    client.println(".alert { background: #b71c1c; color: #ff8a80; }");
+    client.println("</style></head><body>");
+    
+    client.println("<h1>MONITOR DE FATIGA ESP32-C3</h1>");
+    client.println("<div class='card'><h3>Estado Actual</h3>");
+    if (ojoCerrado) {
+      client.println("<div class='status alert'>⚠️ OJO CERRADO / EVALUANDO</div>");
+    } else {
+      client.println("<div class='status ok'>🟢 CONDUCTOR ALERTA</div>");
+    }
+    client.println("</div>");
+
+    client.println("<div class='card'><h3>Incidencias Registradas</h3>");
+    client.println("<div class='metric'>" + String(totalIncidencias) + "</div></div>");
+
+    client.println("<div class='card'><h3>Última Duración de Cierre</h3>");
+    client.println("<div class='metric'>" + String(ultimaDuracionCierre / 1000.0, 2) + " s</div></div>");
+
+    client.println("<br><a href='/RESET' style='color: #00e676; font-size: 18px;'>[ Reiniciar Contador ]</a>");
+    client.println("</body></html>");
+    client.stop();
+  }
+}
